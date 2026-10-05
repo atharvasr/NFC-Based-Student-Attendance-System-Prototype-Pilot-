@@ -1,0 +1,178 @@
+"""Core attendance engine. Knows nothing about NuRe, HTTP, or the ESP32 firmware.
+
+All time decisions use the SERVER clock (datetime.now()). Scanners never send a time.
+"""
+import sqlite3
+from datetime import datetime
+
+
+class SessionStillOpen(Exception):
+    pass
+
+
+def _split(now: datetime) -> tuple[str, str]:
+    return now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
+
+
+def audit( 
+    conn: sqlite3.Connection,
+    actor: str,
+    action: str,
+    student_id: int | None = None,
+    class_id: int | None = None,
+    old_status: str | None = None,
+    new_status: str | None = None,
+    reason: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO audit_log (actor, action, student_id, class_id, old_status, new_status, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (actor, action, student_id, class_id, old_status, new_status, reason),
+    )
+
+
+# ---------------------------------------------------------------- scanning
+
+def process_scan(
+    conn: sqlite3.Connection, token: str, device_id: str, now: datetime | None = None
+) -> dict:
+    """Decide what a scan means, record it, and return the response for the scanner."""
+    now = now or datetime.now()
+    date_s, time_s = _split(now)
+    result = _decide(conn, token, device_id, date_s, time_s)
+    conn.execute(
+        "INSERT INTO scan_log (ts, device_id, token, result) VALUES (?, ?, ?, ?)",
+        (f"{date_s} {time_s}", device_id, token, result["status"]),
+    )
+    return result
+
+
+def _decide(conn: sqlite3.Connection, token: str, device_id: str, date_s: str, time_s: str) -> dict:
+    # 1. Which classes have an open attendance window right now?
+    active = conn.execute(
+        "SELECT class_id, subject, section FROM class_sessions "
+        "WHERE session_date = ? AND start_time <= ? AND end_time > ?",
+        (date_s, time_s, time_s),
+    ).fetchall()
+    if not active:
+        return {"status": "no_active_session"}
+
+    # 2. Who owns this token?
+    cred = conn.execute(
+        "SELECT c.credential_id, c.active AS cred_active, "
+        "       s.student_id, s.name, s.section, s.active AS student_active "
+        "FROM credentials c JOIN students s ON s.student_id = c.student_id "
+        "WHERE c.token = ?",
+        (token,),
+    ).fetchone()
+    if cred is None:
+        return {"status": "unknown_card"}
+
+    # 3. Revoked card or deactivated student
+    if not cred["cred_active"] or not cred["student_active"]:
+        return {"status": "inactive_card", "student": cred["name"]}
+
+    # 4. Is there an open class for this student's section?
+    session = next((s for s in active if s["section"] == cred["section"]), None)
+    if session is None:
+        return {"status": "wrong_section", "student": cred["name"], "section": cred["section"]}
+
+    # 5. Insert; UNIQUE(student_id, class_id) blocks duplicates even for simultaneous requests.
+    try:
+        conn.execute(
+            "INSERT INTO attendance (student_id, class_id, credential_id, device_id, scan_time, status, source) "
+            "VALUES (?, ?, ?, ?, ?, 'PRESENT', 'scanner')",
+            (cred["student_id"], session["class_id"], cred["credential_id"], device_id, f"{date_s} {time_s}"),
+        )
+    except sqlite3.IntegrityError:
+        return {"status": "already_present", "student": cred["name"], "section": cred["section"]}
+
+    audit(conn, f"device:{device_id}", "scan_present", cred["student_id"], session["class_id"], None, "PRESENT")
+    return {
+        "status": "present",
+        "student": cred["name"],
+        "section": cred["section"],
+        "subject": session["subject"],
+        "time": time_s,
+    }
+
+
+# ------------------------------------------------------------ finalization
+
+def finalize_session(
+    conn: sqlite3.Connection, class_id: int, actor: str, now: datetime | None = None
+) -> dict:
+    """After the window closes, give every active student of the section with no record an ABSENT record.
+
+    Safe to call repeatedly and after a server restart: the result depends only on database state.
+    """
+    now = now or datetime.now()
+    date_s, time_s = _split(now)
+    s = conn.execute("SELECT * FROM class_sessions WHERE class_id = ?", (class_id,)).fetchone()
+    if s is None:
+        raise LookupError("session not found")
+    if s["finalized"]:
+        return {"class_id": class_id, "already_finalized": True, "absent_marked": 0}
+
+    closed = s["session_date"] < date_s or (s["session_date"] == date_s and s["end_time"] <= time_s)
+    if not closed:
+        raise SessionStillOpen(f"window closes at {s['end_time']}")
+
+    missing = conn.execute(
+        "SELECT student_id FROM students WHERE active = 1 AND section = ? "
+        "AND student_id NOT IN (SELECT student_id FROM attendance WHERE class_id = ?)",
+        (s["section"], class_id),
+    ).fetchall()
+    for row in missing:
+        conn.execute(
+            "INSERT INTO attendance (student_id, class_id, status, source) VALUES (?, ?, 'ABSENT', 'system')",
+            (row["student_id"], class_id),
+        )
+        audit(conn, actor, "mark_absent", row["student_id"], class_id, None, "ABSENT")
+    conn.execute("UPDATE class_sessions SET finalized = 1 WHERE class_id = ?", (class_id,))
+    audit(conn, actor, "finalize_session", class_id=class_id, reason=f"absent_marked={len(missing)}")
+    return {"class_id": class_id, "already_finalized": False, "absent_marked": len(missing)}
+
+
+def finalize_all_due(conn: sqlite3.Connection, actor: str, now: datetime | None = None) -> int:
+    now = now or datetime.now()
+    date_s, time_s = _split(now)
+    due = conn.execute(
+        "SELECT class_id FROM class_sessions WHERE finalized = 0 "
+        "AND (session_date < ? OR (session_date = ? AND end_time <= ?))",
+        (date_s, date_s, time_s),
+    ).fetchall()
+    for row in due:
+        finalize_session(conn, row["class_id"], actor, now)
+    return len(due)
+
+
+# ------------------------------------------------------- staff corrections
+
+def correct_attendance(
+    conn: sqlite3.Connection, student_id: int, class_id: int, new_status: str, reason: str, actor: str
+) -> dict:
+    if conn.execute("SELECT 1 FROM students WHERE student_id = ?", (student_id,)).fetchone() is None:
+        raise LookupError("student not found")
+    if conn.execute("SELECT 1 FROM class_sessions WHERE class_id = ?", (class_id,)).fetchone() is None:
+        raise LookupError("session not found")
+
+    row = conn.execute(
+        "SELECT status FROM attendance WHERE student_id = ? AND class_id = ?", (student_id, class_id)
+    ).fetchone()
+    old = row["status"] if row else None
+    if old == new_status:
+        return {"changed": False, "status": new_status}
+
+    if row is None:
+        conn.execute(
+            "INSERT INTO attendance (student_id, class_id, status, source) VALUES (?, ?, ?, 'staff')",
+            (student_id, class_id, new_status),
+        )
+    else:
+        conn.execute(
+            "UPDATE attendance SET status = ?, source = 'staff' WHERE student_id = ? AND class_id = ?",
+            (new_status, student_id, class_id),
+        )
+    audit(conn, actor, "correct_attendance", student_id, class_id, old, new_status, reason)
+    return {"changed": True, "old_status": old, "new_status": new_status}
