@@ -1,0 +1,35 @@
+import re
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class ScanRequest(BaseModel):
+    """The scanner sends only the token. No time, no student info, no decisions."""
+
+    token: str
+
+    @field_validator("token")
+    @classmethod
+    def normalize_token(cls, v: str) -> str:
+        v = v.strip().upper()
+        # NFC UIDs are 4, 7 or 10 bytes -> 8, 14 or 20 hex characters
+        if not re.fullmatch(r"[0-9A-F]{8,20}", v):
+            raise ValueError("token must be 8-20 hex characters")
+        return v
+
+
+class ScanResponse(BaseModel):
+    status: str
+    student: str | None = None
+    section: str | None = None
+    subject: str | None = None
+    time: str | None = None
+
+
+class CorrectionRequest(BaseModel):
+    student_id: int
+    class_id: int
+    new_status: Literal["PRESENT", "ABSENT"]
+    reason: str = Field(min_length=3, max_length=500)
+    staff_name: str = Field(min_length=1, max_length=80)  # self-reported until real staff logins exist
