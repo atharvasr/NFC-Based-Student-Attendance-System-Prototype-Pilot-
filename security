@@ -1,0 +1,22 @@
+import hashlib
+import hmac
+import sqlite3
+
+_DUMMY_HASH = "0" * 64
+
+
+def hash_key(key: str) -> str:
+    # Device keys are long random strings, so a plain SHA-256 is enough here.
+    # (Human-chosen passwords would need a slow hash such as argon2.)
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def authenticate_device(conn: sqlite3.Connection, device_id: str, key: str) -> bool:
+    row = conn.execute(
+        "SELECT key_hash, active FROM devices WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    given = hash_key(key)
+    if row is None:
+        hmac.compare_digest(given, _DUMMY_HASH)  # keep timing similar for unknown ids
+        return False
+    return hmac.compare_digest(given, row["key_hash"]) and row["active"] == 1
