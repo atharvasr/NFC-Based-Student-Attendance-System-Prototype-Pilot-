@@ -1,0 +1,75 @@
+"""Reset test data (devices are kept).
+
+    python seed.py              # a class is open right now (started 5 min ago)
+    python seed.py --no-active  # the class window already closed 10 min ago
+
+Do not run close to midnight: times are computed from the current clock.
+"""
+import sys
+from datetime import datetime, timedelta
+
+from database import db, init_db
+
+# (student_id, university_student_id, name, section) -- ids are placeholders
+STUDENTS = [
+    (101, "TEST-0101", "Atharva", "CSE-A"),
+    (102, "TEST-0102", "Krishna", "CSE-A"),
+    (103, "TEST-0103", "Riya", "CSE-A"),
+    (104, "TEST-0104", "Neel", "CSE-B"),
+]
+
+# (student_id, token, active)
+CREDENTIALS = [
+    (101, "04A1B2C3D4", 1),
+    (102, "04B2C3D4E5", 1),
+    (103, "04DEADBEEF", 0),  # revoked (lost card)
+    (104, "04C0FFEE01", 1),  # CSE-B: no class open for this section
+]
+
+DROP_ORDER = ("attendance", "scan_log", "audit_log", "class_sessions", "credentials", "students")
+
+
+def main() -> None:
+    no_active = "--no-active" in sys.argv
+    now = datetime.now().replace(microsecond=0)
+    today = now.strftime("%Y-%m-%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if no_active:
+        start, end = now - timedelta(minutes=70), now - timedelta(minutes=10)
+    else:
+        start, end = now - timedelta(minutes=5), now + timedelta(minutes=55)
+
+    with db() as conn:
+        for table in DROP_ORDER:
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+    init_db()
+
+    with db() as conn:
+        conn.executemany(
+            "INSERT INTO students (student_id, university_student_id, name, section) VALUES (?, ?, ?, ?)",
+            STUDENTS,
+        )
+        conn.executemany("INSERT INTO credentials (student_id, token, active) VALUES (?, ?, ?)", CREDENTIALS)
+        # class_id 1: today's class
+        conn.execute(
+            "INSERT INTO class_sessions (subject_code, subject, section, session_date, start_time, end_time) "
+            "VALUES ('PHY101', 'Engineering Physics', 'CSE-A', ?, ?, ?)",
+            (today, start.strftime("%H:%M:%S"), end.strftime("%H:%M:%S")),
+        )
+        # class_id 2: yesterday's class, already over, not yet finalized
+        conn.execute(
+            "INSERT INTO class_sessions (subject_code, subject, section, session_date, start_time, end_time) "
+            "VALUES ('MAT101', 'Mathematics', 'CSE-A', ?, '09:10:00', '10:00:00')",
+            (yesterday,),
+        )
+        conn.execute(
+            "INSERT INTO attendance (student_id, class_id, credential_id, scan_time, status, source) "
+            "VALUES (101, 2, 1, ?, 'PRESENT', 'scanner')",
+            (f"{yesterday} 09:14:02",),
+        )
+    print(f"Seeded. Class 1 window: {start:%H:%M:%S} - {end:%H:%M:%S} ({'closed' if no_active else 'open'})")
+
+
+if __name__ == "__main__":
+    main()
