@@ -1,0 +1,48 @@
+"""Register or revoke a scanner device.
+
+    python register_device.py classroom-1 "Room 101 scanner"   # prints the key ONCE
+    python register_device.py --revoke classroom-1
+"""
+import secrets
+import sqlite3
+import sys
+
+from attendance import audit
+from database import db, init_db
+from security import hash_key
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    init_db()
+
+    if len(args) == 2 and args[0] == "--revoke":
+        with db() as conn:
+            cur = conn.execute("UPDATE devices SET active = 0 WHERE device_id = ?", (args[1],))
+            if cur.rowcount:
+                audit(conn, "admin", "revoke_device", reason=args[1])
+        print("revoked" if cur.rowcount else "no such device")
+        return
+
+    if len(args) != 2:
+        sys.exit(__doc__)
+
+    device_id, label = args
+    key = secrets.token_urlsafe(32)
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO devices (device_id, label, key_hash) VALUES (?, ?, ?)",
+                (device_id, label, hash_key(key)),
+            )
+            audit(conn, "admin", "register_device", reason=device_id)
+    except sqlite3.IntegrityError:
+        sys.exit(f"device '{device_id}' already exists")
+
+    print(f"device_id: {device_id}")
+    print(f"key:       {key}")
+    print("Save this key now (it goes into the ESP32 secrets file). It cannot be shown again.")
+
+
+if __name__ == "__main__":
+    main()
