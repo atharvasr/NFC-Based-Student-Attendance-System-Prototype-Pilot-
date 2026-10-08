@@ -1,0 +1,33 @@
+"""Boundary for future student-information-system integrations (e.g. NuRe Campus).
+
+Nothing in the attendance engine imports this module, and no adapter exists yet.
+A real adapter may only be written against an official API, an official import/export
+format, or a method the university explicitly authorizes. No scraping, no portal
+automation, no bypassing authentication.
+"""
+from dataclasses import dataclass
+from typing import Protocol
+
+
+@dataclass
+class SyncError:
+    record: str   # e.g. "student university_student_id=..." or "class_id=..."
+    message: str
+
+
+class StudentInfoSystemAdapter(Protocol):
+    def export_attendance(self, class_id: int) -> list[SyncError]:
+        """Send one finalized session's attendance out. Returns per-record errors."""
+        ...
+
+    def sync_students(self) -> list[SyncError]:
+        """Pull the official student list, matching on university_student_id."""
+        ...
+
+    def sync_classes(self) -> list[SyncError]:
+        """Pull the official subjects/timetable, matching on subject_code."""
+        ...
+
+    def reconcile(self, class_id: int) -> list[SyncError]:
+        """Compare local records with the external system and report differences."""
+        ...
