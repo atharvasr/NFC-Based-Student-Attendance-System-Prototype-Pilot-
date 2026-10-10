@@ -14,7 +14,7 @@ def _split(now: datetime) -> tuple[str, str]:
     return now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
 
 
-def audit( 
+def audit(
     conn: sqlite3.Connection,
     actor: str,
     action: str,
