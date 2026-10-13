@@ -8,12 +8,10 @@ automation, no bypassing authentication.
 from dataclasses import dataclass
 from typing import Protocol
 
-
-@dataclass
+ @dataclass
 class SyncError:
     record: str   # e.g. "student university_student_id=..." or "class_id=..."
     message: str
-
 
 class StudentInfoSystemAdapter(Protocol):
     def export_attendance(self, class_id: int) -> list[SyncError]:
