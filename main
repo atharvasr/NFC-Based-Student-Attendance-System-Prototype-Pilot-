@@ -55,7 +55,6 @@ def scan(req: ScanRequest, x_device_id: str = Header(), x_device_key: str = Head
         raise HTTPException(status_code=401, detail="invalid device credentials")
     return result
 
-
 # -------------------------------------------------------------- admin API
 # One shared admin key for the prototype. Named staff accounts come later.
 
