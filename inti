@@ -1,7 +1,7 @@
 
 
 @dataclass
-class SyncError;
+class SyncError:
     record: str   # e.g. "student university_student_id=..." or "class_id=..."
     message: str
 
